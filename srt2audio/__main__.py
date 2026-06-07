@@ -14,12 +14,23 @@ import sys
 def _run_cli(argv: list[str]) -> int:
     from .processor import export_job, run_job
     from .srt_parser import parse_srt_file
-    from .tts_client import CapCutTTSClient, DEFAULT_BASE_URL, TTSParams
+    from .tts_client import API_V1, API_V2, CapCutTTSClient, DEFAULT_BASE_URL, TTSParams
 
     parser = argparse.ArgumentParser(prog="srt2audio", description="SRT -> audio via CapCut TTS")
     parser.add_argument("srt", help="Input .srt file")
     parser.add_argument("out", help="Output audio file")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument(
+        "--api-version",
+        choices=[API_V2, API_V1],
+        default=API_V2,
+        help="v2 = account-login flow (default); v1 = legacy DEVICE_TIME/SIGN",
+    )
+    parser.add_argument(
+        "--speaker",
+        default=None,
+        help="v2 speaker id (e.g. ICL_en_male_henry1); overrides --voice on v2",
+    )
     parser.add_argument("--voice", type=int, default=0)
     parser.add_argument("--pitch", type=int, default=10)
     parser.add_argument("--speed", type=int, default=10)
@@ -30,9 +41,13 @@ def _run_cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     subtitles = parse_srt_file(args.srt)
-    client = CapCutTTSClient(base_url=args.base_url)
+    client = CapCutTTSClient(base_url=args.base_url, api_version=args.api_version)
     params = TTSParams(
-        voice_type=args.voice, pitch=args.pitch, speed=args.speed, volume=args.volume
+        voice_type=args.voice,
+        speaker=args.speaker,
+        pitch=args.pitch,
+        speed=args.speed,
+        volume=args.volume,
     )
     job = run_job(
         subtitles,
