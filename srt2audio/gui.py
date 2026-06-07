@@ -31,7 +31,15 @@ from PySide6.QtWidgets import (
 
 from .processor import JobResult, MAX_WORKERS_LIMIT, export_job, run_job
 from .srt_parser import SrtParseError, parse_srt_file
-from .tts_client import VOICES, CapCutTTSClient, DEFAULT_BASE_URL, TTSError, TTSParams
+from .tts_client import (
+    API_V1,
+    API_V2,
+    VOICES,
+    CapCutTTSClient,
+    DEFAULT_BASE_URL,
+    TTSError,
+    TTSParams,
+)
 
 
 class JobWorker(QObject):
@@ -52,9 +60,14 @@ class JobWorker(QObject):
         try:
             subtitles = parse_srt_file(cfg["srt_path"])
             self.log.emit(f"Đã đọc {len(subtitles)} đoạn từ SRT.")
-            client = CapCutTTSClient(base_url=cfg["base_url"], timeout=cfg["timeout"])
+            client = CapCutTTSClient(
+                base_url=cfg["base_url"],
+                api_version=cfg["api_version"],
+                timeout=cfg["timeout"],
+            )
             params = TTSParams(
                 voice_type=cfg["voice_type"],
+                speaker=cfg["speaker"],
                 pitch=cfg["pitch"],
                 speed=cfg["speed"],
                 volume=cfg["volume"],
@@ -177,10 +190,23 @@ class MainWindow(QMainWindow):
         url_widget.setLayout(url_row)
         form.addRow("Base URL:", url_widget)
 
+        # API version: v2 (account login, real speakers) is the default; v1 is
+        # the legacy token flow.
+        self.api_combo = QComboBox()
+        self.api_combo.addItem("v2 (\u0111\u0103ng nh\u1eadp t\u00e0i kho\u1ea3n)", API_V2)
+        self.api_combo.addItem("v1 (legacy DEVICE_TIME/SIGN)", API_V1)
+        form.addRow("API:", self.api_combo)
+
         self.voice_combo = QComboBox()
-        for voice in VOICES:
-            self.voice_combo.addItem(str(voice["label"]), voice["type"])
-        form.addRow("Gi\u1ecdng:", self.voice_combo)
+        self._load_legacy_voices()
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(self.voice_combo, stretch=1)
+        self.load_voices_btn = QPushButton("T\u1ea3i gi\u1ecdng t\u1eeb server")
+        self.load_voices_btn.clicked.connect(self._on_load_speakers)
+        voice_row.addWidget(self.load_voices_btn)
+        voice_widget = QWidget()
+        voice_widget.setLayout(voice_row)
+        form.addRow("Gi\u1ecdng:", voice_widget)
 
         self.pitch_spin = self._make_spin(0, 20, 10)
         self.speed_spin = self._make_spin(0, 20, 10)
@@ -205,6 +231,35 @@ class MainWindow(QMainWindow):
         self.max_speed_spin.setValue(2.0)
         form.addRow("T\u0103ng t\u1ed1c t\u1ed1i \u0111a (x):", self.max_speed_spin)
         return box
+
+    def _load_legacy_voices(self) -> None:
+        """Populate the voice dropdown with the static legacy ``type`` list."""
+
+        self.voice_combo.clear()
+        for voice in VOICES:
+            self.voice_combo.addItem(str(voice["label"]), voice["type"])
+
+    def _populate_speakers(self, speakers: list) -> None:
+        """Replace the voice dropdown with live speaker ids (data = str id)."""
+
+        self.voice_combo.clear()
+        for sp in speakers:
+            label = sp["name"] if sp["name"] != sp["id"] else sp["id"]
+            self.voice_combo.addItem(f"{label}  [{sp['id']}]", sp["id"])
+
+    def _on_load_speakers(self) -> None:
+        url = self.base_url_edit.text().strip() or DEFAULT_BASE_URL
+        try:
+            client = CapCutTTSClient(base_url=url, timeout=20.0, max_retries=1)
+            speakers = client.list_speakers()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "L\u1ed7i t\u1ea3i gi\u1ecdng", str(exc))
+            return
+        if not speakers:
+            QMessageBox.warning(self, "Tr\u1ed1ng", "Server kh\u00f4ng tr\u1ea3 v\u1ec1 gi\u1ecdng n\u00e0o.")
+            return
+        self._populate_speakers(speakers)
+        self._append_log(f"\u0110\u00e3 t\u1ea3i {len(speakers)} gi\u1ecdng t\u1eeb server.")
 
     @staticmethod
     def _make_spin(lo: int, hi: int, val: int) -> QSpinBox:
@@ -249,14 +304,23 @@ class MainWindow(QMainWindow):
         if not out_path:
             QMessageBox.warning(self, "Thi\u1ebfu file", "Vui l\u00f2ng ch\u1ecdn n\u01a1i l\u01b0u file xu\u1ea5t.")
             return None
+        data = self.voice_combo.currentData()
+        speaker: Optional[str] = None
+        voice_type = 0
+        if isinstance(data, str):
+            speaker = data
+        elif data is not None:
+            voice_type = int(data)
         return {
             "srt_path": srt_path,
             "out_path": out_path,
             "fmt": self.fmt_combo.currentText(),
             "bitrate": "192k",
             "base_url": self.base_url_edit.text().strip() or DEFAULT_BASE_URL,
+            "api_version": str(self.api_combo.currentData()),
             "timeout": 60.0,
-            "voice_type": int(self.voice_combo.currentData()),
+            "voice_type": voice_type,
+            "speaker": speaker,
             "pitch": self.pitch_spin.value(),
             "speed": self.speed_spin.value(),
             "volume": self.volume_spin.value(),
@@ -266,15 +330,22 @@ class MainWindow(QMainWindow):
 
     def _on_test_connection(self) -> None:
         url = self.base_url_edit.text().strip() or DEFAULT_BASE_URL
+        api_version = str(self.api_combo.currentData())
         try:
-            client = CapCutTTSClient(base_url=url, timeout=15.0, max_retries=1)
-            client.check_connection(
-                TTSParams(voice_type=int(self.voice_combo.currentData()))
+            client = CapCutTTSClient(
+                base_url=url, api_version=api_version, timeout=20.0, max_retries=1
             )
+            client.check_connection()
+            # On v2, also refresh the live speaker list so the user can pick a
+            # real voice straight away.
+            speakers = client.list_speakers() if api_version == API_V2 else []
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "K\u1ebft n\u1ed1i th\u1ea5t b\u1ea1i", str(exc))
-        else:
-            QMessageBox.information(self, "OK", "K\u1ebft n\u1ed1i t\u1edbi server TTS th\u00e0nh c\u00f4ng.")
+            return
+        if speakers:
+            self._populate_speakers(speakers)
+            self._append_log(f"\u0110\u00e3 t\u1ea3i {len(speakers)} gi\u1ecdng t\u1eeb server.")
+        QMessageBox.information(self, "OK", "K\u1ebft n\u1ed1i t\u1edbi server TTS th\u00e0nh c\u00f4ng.")
 
     def _on_start(self) -> None:
         config = self._collect_config()
